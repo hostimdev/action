@@ -1,0 +1,35 @@
+name: "Hostim App Control"
+description: "Restart or rebuild a Hostim app from GitHub Actions"
+author: "Hostim.dev"
+
+inputs:
+  api_token:
+    description: "Hostim API token"
+    required: true
+  project:
+    description: "Project ID"
+    required: true
+  app:
+    description: "App name"
+    required: true
+  action:
+    description: "Action to perform: restart or rebuild"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate action
+      shell: bash
+      run: |
+        if [[ "${{ inputs.action }}" != "restart" && "${{ inputs.action }}" != "rebuild" ]]; then
+          echo "Invalid action: ${{ inputs.action }}"
+          exit 1
+        fi
+
+    - name: Call Hostim API
+      shell: bash
+      run: |
+        curl -f -X POST \
+          -H "Authorization: Bearer ${{ inputs.api_token }}" \
+          https://api.hostim.dev/api/projects/${{ inputs.project }}/apps/${{ inputs.app }}/${{ inputs.action }}
