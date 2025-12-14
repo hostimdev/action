@@ -30,6 +30,6 @@ runs:
     - name: Call Hostim API
       shell: bash
       run: |
-        curl -f -X POST \
+        curl -s -f -X POST \
           -H "Authorization: Bearer ${{ inputs.api_token }}" \
           https://api.hostim.dev/api/projects/${{ inputs.project }}/apps/${{ inputs.app }}/${{ inputs.action }}
