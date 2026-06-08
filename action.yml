@@ -144,7 +144,7 @@ runs:
       run: |
         set -euo pipefail
         url="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP/$ACTION"
-        curl -sf -X POST -H "Authorization: Bearer $API_TOKEN" "$url"
+        curl -sf -o /dev/null -X POST -H "Authorization: Bearer $API_TOKEN" "$url"
         echo "✅ $ACTION triggered"
 
     - name: Wait for deploy result
