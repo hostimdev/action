@@ -1,5 +1,5 @@
 name: "Hostim App Control"
-description: "Restart or rebuild a Hostim app from GitHub Actions"
+description: "Restart, rebuild, or deploy a new image to a Hostim app from GitHub Actions, and wait for the build result"
 author: "Hostim.dev"
 
 inputs:
@@ -13,23 +13,217 @@ inputs:
     description: "App name"
     required: true
   action:
-    description: "Action to perform: restart or rebuild"
-    required: true
+    description: "Action to perform: restart or rebuild. Optional when 'image' is provided."
+    required: false
+    default: ""
+  image:
+    description: "New docker image (including tag) to deploy, e.g. myorg/app:v1.2.3. Docker-source apps only. When set, the image is updated and the app is redeployed; 'action' is ignored."
+    required: false
+    default: ""
+  wait:
+    description: "Wait until the new version is live (build, if any, plus rollout) and fail the job if it doesn't come up. Only applies when something is deployed (rebuild or image deploy)."
+    required: false
+    default: "true"
+  timeout:
+    description: "Maximum seconds to wait for the deploy to reach a terminal state."
+    required: false
+    default: "600"
 
 runs:
   using: "composite"
   steps:
-    - name: Validate action
+    - name: Validate inputs
       shell: bash
+      env:
+        ACTION: ${{ inputs.action }}
+        IMAGE: ${{ inputs.image }}
+        WAIT: ${{ inputs.wait }}
       run: |
-        if [[ "${{ inputs.action }}" != "restart" && "${{ inputs.action }}" != "rebuild" ]]; then
-          echo "Invalid action: ${{ inputs.action }}"
+        set -euo pipefail
+
+        if [ -z "$ACTION" ] && [ -z "$IMAGE" ]; then
+          echo "::error::Provide either 'action' (restart|rebuild) or 'image'."
+          exit 1
+        fi
+        if [ -n "$ACTION" ] && [ "$ACTION" != "restart" ] && [ "$ACTION" != "rebuild" ]; then
+          echo "::error::Invalid action: '$ACTION' (expected 'restart' or 'rebuild')."
+          exit 1
+        fi
+        if [ -n "$IMAGE" ] && [ -n "$ACTION" ]; then
+          echo "::notice::'image' is set — deploying the new image and ignoring action='$ACTION'."
+        fi
+
+        # Something to wait on is produced by an image deploy or an explicit rebuild
+        # (a restart neither builds nor rolls out a new version).
+        if [ -n "$IMAGE" ] || [ "$ACTION" = "rebuild" ]; then
+          will_deploy=true
+        else
+          will_deploy=false
+        fi
+        should_wait=false
+        if [ "$WAIT" = "true" ] && [ "$will_deploy" = "true" ]; then
+          should_wait=true
+        fi
+
+        {
+          echo "HOSTIM_API_URL=https://api.hostim.dev"
+          echo "HOSTIM_SHOULD_WAIT=$should_wait"
+        } >> "$GITHUB_ENV"
+
+        echo "will_deploy=$will_deploy should_wait=$should_wait"
+
+    - name: Resolve wait target
+      if: ${{ env.HOSTIM_SHOULD_WAIT == 'true' }}
+      shell: bash
+      env:
+        API_TOKEN: ${{ inputs.api_token }}
+        PROJECT: ${{ inputs.project }}
+        APP: ${{ inputs.app }}
+      run: |
+        set -euo pipefail
+        base="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP"
+
+        # Only git-source apps build from source; docker apps just pull an image
+        # and roll out, so there is no build status to wait on — track the rollout.
+        type=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$base" | jq -r '.deploymentSource.type // ""')
+        status=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$base/status")
+
+        if [ "$type" = "git" ]; then
+          mode=build
+        else
+          mode=runtime
+        fi
+
+        {
+          echo "HOSTIM_WAIT_MODE=$mode"
+          echo "HOSTIM_BUILT_BEFORE=$(echo "$status" | jq -r '.lastBuiltAt // ""')"
+          echo "HOSTIM_DEPLOYED_BEFORE=$(echo "$status" | jq -r '.lastDeployedAt // ""')"
+        } >> "$GITHUB_ENV"
+        echo "wait mode: $mode (app type: ${type:-unknown})"
+
+    - name: Deploy new image
+      if: ${{ inputs.image != '' }}
+      shell: bash
+      env:
+        API_TOKEN: ${{ inputs.api_token }}
+        PROJECT: ${{ inputs.project }}
+        APP: ${{ inputs.app }}
+        IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        base="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP"
+
+        app=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$base")
+
+        type=$(echo "$app" | jq -r '.deploymentSource.type // ""')
+        if [ "$type" != "docker" ]; then
+          echo "::error::App '$APP' is a '$type' app — 'image' only applies to docker apps. Use action: rebuild instead."
           exit 1
         fi
 
-    - name: Call Hostim API
+        updated=$(echo "$app" | jq --arg img "$IMAGE" '.deploymentSource.docker.image = $img')
+
+        code=$(curl -s -o /tmp/hostim_put.out -w '%{http_code}' -X PUT \
+          -H "Authorization: Bearer $API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$updated" "$base")
+        if [ "$code" != "200" ]; then
+          echo "::error::Failed to update image (HTTP $code): $(cat /tmp/hostim_put.out)"
+          exit 1
+        fi
+        echo "✅ image set to $IMAGE — redeploy triggered"
+
+    - name: Trigger action
+      if: ${{ inputs.image == '' }}
       shell: bash
+      env:
+        API_TOKEN: ${{ inputs.api_token }}
+        PROJECT: ${{ inputs.project }}
+        APP: ${{ inputs.app }}
+        ACTION: ${{ inputs.action }}
       run: |
-        curl -s -f -X POST \
-          -H "Authorization: Bearer ${{ inputs.api_token }}" \
-          https://api.hostim.dev/api/projects/${{ inputs.project }}/apps/${{ inputs.app }}/${{ inputs.action }}
+        set -euo pipefail
+        url="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP/$ACTION"
+        curl -sf -X POST -H "Authorization: Bearer $API_TOKEN" "$url"
+        echo "✅ $ACTION triggered"
+
+    - name: Wait for deploy result
+      if: ${{ env.HOSTIM_SHOULD_WAIT == 'true' }}
+      shell: bash
+      env:
+        API_TOKEN: ${{ inputs.api_token }}
+        PROJECT: ${{ inputs.project }}
+        APP: ${{ inputs.app }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -uo pipefail
+        status_url="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP/status"
+        events_url="$HOSTIM_API_URL/api/projects/$PROJECT/apps/$APP/events"
+        built_before="${HOSTIM_BUILT_BEFORE:-}"
+        deployed_before="${HOSTIM_DEPLOYED_BEFORE:-}"
+        deadline=$(( $(date +%s) + TIMEOUT ))
+        seen_build_running=false
+
+        # phase = what we are waiting on right now.
+        #   build   -> git source build (then advances to "rollout" on success)
+        #   rollout -> the new image becoming live (docker apps start here directly)
+        phase="${HOSTIM_WAIT_MODE:-build}"
+        [ "$phase" = "runtime" ] && phase=rollout
+
+        # Let the new build/rollout register before we trust any status,
+        # otherwise we might read the PREVIOUS deploy's result.
+        sleep 10
+
+        print_failure_events() {
+          echo "----- recent warning events -----"
+          curl -sf -H "Authorization: Bearer $API_TOKEN" "$events_url" 2>/dev/null \
+            | jq -r '[.[] | select(.type=="Warning")] | .[-5:][] | "  [\(.reason)] \(.message)"' \
+            || echo "  (could not fetch events)"
+          echo "---------------------------------"
+        }
+
+        while :; do
+          body=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$status_url" || echo '{}')
+
+          if [ "$phase" = "build" ]; then
+            # git apps build from source first. A successful build is necessary but
+            # not sufficient — the freshly built image still has to roll out — so on
+            # success we advance to the rollout phase rather than declaring victory.
+            bs=$(echo "$body" | jq -r '.buildStatus // "unknown"')
+            built=$(echo "$body" | jq -r '.lastBuiltAt // ""')
+            [ "$bs" = "running" ] && seen_build_running=true
+
+            # Trust a terminal build status only once a NEW build has started
+            # (observed running, or lastBuiltAt advanced past the baseline).
+            if [ "$seen_build_running" = "true" ] || { [ -n "$built" ] && [ "$built" != "$built_before" ]; }; then
+              case "$bs" in
+                succeeded) echo "✅ build succeeded (lastBuiltAt=$built) — waiting for rollout"; phase=rollout ;;
+                failed)    echo "❌ build failed (lastBuiltAt=$built)"; print_failure_events; exit 1 ;;
+              esac
+            fi
+            [ "$phase" = "build" ] && echo "waiting… build status=$bs"
+          fi
+
+          if [ "$phase" = "rollout" ]; then
+            # No build happens here (docker apps) or the build is already done (git).
+            # runtimeStatus reflects the latest ReplicaSet's pods, and a new rollout
+            # advances lastDeployedAt, so we only judge once it has changed.
+            rs=$(echo "$body" | jq -r '.runtimeStatus // "unknown"')
+            deployed=$(echo "$body" | jq -r '.lastDeployedAt // ""')
+            if [ -n "$deployed" ] && [ "$deployed" != "$deployed_before" ]; then
+              case "$rs" in
+                running)          echo "✅ deployed and running (lastDeployedAt=$deployed)"; exit 0 ;;
+                imagePullBackoff) echo "❌ image pull failed — bad image or tag?"; print_failure_events; exit 1 ;;
+                # 'pending'/'crashing' may be transient during rollout — keep waiting.
+              esac
+            fi
+            echo "waiting… rollout status=$rs"
+          fi
+
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "⏱️ timed out after ${TIMEOUT}s (phase=$phase)"
+            print_failure_events
+            exit 1
+          fi
+          sleep 5
+        done
