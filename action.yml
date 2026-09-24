@@ -121,7 +121,7 @@ runs:
           exit 1
         fi
 
-        updated=$(echo "$app" | jq --arg img "$IMAGE" '.deploymentSource.docker.image = $img')
+        updated=$(echo "$app" | jq --arg img "$IMAGE" '.deploymentSource.docker.image = $img | .domains //= [] | .volumeMounts //= []')
 
         code=$(curl -s -o /tmp/hostim_put.out -w '%{http_code}' -X PUT \
           -H "Authorization: Bearer $API_TOKEN" \
